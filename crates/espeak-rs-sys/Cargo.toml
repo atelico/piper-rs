@@ -5,6 +5,11 @@ edition = "2021"
 description = "Rust bindings to espeak-ng"
 license = "MIT"
 repository = "https://github.com/thewh1teagle/piper-rs"
+# `links` enables `cargo:data-dir=...` metadata emitted by build.rs to be
+# surfaced to downstream crates as `DEP_ESPEAK_NG_DATA_DIR`. Used by iOS
+# cross-compile to locate the host-built phoneme data (phondata/phontab/etc.)
+# for bundling into the app.
+links = "espeak-ng"
 
 include = [
     "espeak-ng/CMakeLists.txt",

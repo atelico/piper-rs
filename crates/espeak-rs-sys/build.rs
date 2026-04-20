@@ -49,6 +49,110 @@ fn copy_folder(src: &Path, dst: &Path) {
     }
 }
 
+/// Drive a separate cmake build of espeak-ng for the HOST architecture to
+/// produce the phoneme data files (phondata, phontab, phonindex, per-language
+/// dicts). Used on iOS cross-compile because the iOS-arm64 binary can't be
+/// executed on the host to generate these files at build time.
+///
+/// Outputs end up in `<out_dir>/espeak-ng-data-host/`. Callers emit this path
+/// as `cargo:data-dir=...` so downstream crates can stage it into the iOS
+/// app's resource bundle. At runtime, the app passes the bundle path to
+/// `espeak_ng_InitializePath()` to override the compile-time `path_home`.
+fn build_host_espeak_data(espeak_dst: &Path, out_dir: &Path, n_path_home: &str) {
+    let host_build = out_dir.join("espeak-ng-host-build");
+    let host_install = out_dir.join("espeak-ng-host-install");
+    let data_dst = out_dir.join("espeak-ng-data-host");
+
+    // If we've already produced the data files, nothing to do.
+    if data_dst.join("phondata").exists() {
+        debug_log!("host espeak data already present: {:?}", data_dst);
+        return;
+    }
+
+    // Reuse the espeak-ng source tree the main flow already copied to
+    // `$OUT_DIR/espeak-ng`. Host and target builds share sources but write to
+    // separate build dirs so artifacts don't collide.
+    assert!(
+        espeak_dst.join("CMakeLists.txt").exists(),
+        "espeak source missing CMakeLists.txt at {:?}",
+        espeak_dst
+    );
+    std::fs::create_dir_all(&host_build).expect("create host_build");
+
+    // Configure host build. We deliberately do NOT pass --target / -isysroot
+    // etc., because we want the compiler to produce host-native binaries.
+    let cflags = format!("-DN_PATH_HOME={} -w", n_path_home);
+    let status = Command::new("cmake")
+        .arg(espeak_dst)
+        .arg("-B")
+        .arg(&host_build)
+        .arg("-DBUILD_SHARED_LIBS=OFF")
+        .arg("-DUSE_LIBPCAUDIO=OFF")
+        .arg("-DENABLE_TESTS=OFF")
+        .arg("-DCOMPILE_INTONATIONS=ON")
+        .arg("-DCMAKE_BUILD_TYPE=Release")
+        .arg(format!("-DCMAKE_INSTALL_PREFIX={}", host_install.display()))
+        .arg(format!("-DCMAKE_C_FLAGS={}", cflags))
+        .arg(format!("-DCMAKE_CXX_FLAGS={}", cflags))
+        // Apple silicon explicit — cmake otherwise picks this up from the
+        // environment, but we're not inheriting the cross-compile env here.
+        .env_remove("SDKROOT")
+        .env_remove("CFLAGS")
+        .env_remove("CXXFLAGS")
+        .env_remove("TARGET")
+        .status()
+        .expect("failed to run host cmake configure");
+    assert!(status.success(), "host cmake configure failed");
+
+    let status = Command::new("cmake")
+        .arg("--build")
+        .arg(&host_build)
+        .arg("--target")
+        .arg("data")
+        .arg("--config")
+        .arg("Release")
+        .arg("--parallel")
+        .env_remove("SDKROOT")
+        .status()
+        .expect("failed to run host cmake build");
+    assert!(status.success(), "host cmake --build data failed");
+
+    // The `data` target writes into `<host_build>/espeak-ng-data/`. Copy the
+    // relevant files into `data_dst` so downstream consumers have a stable
+    // location to read from.
+    let src_data = host_build.join("espeak-ng-data");
+    if !src_data.join("phondata").exists() {
+        panic!(
+            "host build did not produce phondata at {:?}; contents: {:?}",
+            src_data,
+            std::fs::read_dir(&src_data)
+                .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.file_name())).collect::<Vec<_>>())
+                .unwrap_or_default()
+        );
+    }
+    std::fs::create_dir_all(&data_dst).expect("create data_dst");
+    copy_folder_contents(&src_data, &data_dst);
+    debug_log!("host espeak-ng-data -> {:?}", data_dst);
+}
+
+/// Recursive copy of `src`'s contents into `dst` (does not copy `src` itself).
+fn copy_folder_contents(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).ok();
+    let entries = match std::fs::read_dir(src) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_folder_contents(&from, &to);
+        } else {
+            let _ = std::fs::copy(&from, &to);
+        }
+    }
+}
+
 fn extract_lib_names(out_dir: &Path, build_shared_libs: bool) -> Vec<String> {
     let lib_pattern = if cfg!(windows) {
         "*.lib"
@@ -256,7 +360,71 @@ fn main() {
     config.cxxflag(&flag);
     debug_log!("N_PATH_HOME override: {}", n_path_home);
 
-    let bindings_dir = config.build();
+    // ---------------------------------------------------------------------
+    // iOS cross-compile handling.
+    //
+    // Two problems arise when targeting aarch64-apple-ios from a mac host:
+    //
+    //   1. cmake with CMAKE_SYSTEM_NAME=iOS turns MACOSX_BUNDLE ON by default
+    //      for executable targets. espeak-ng's src/CMakeLists.txt does a
+    //      bare `install(TARGETS espeak-ng-bin)` with no BUNDLE DESTINATION,
+    //      which fails at configure time on iOS.
+    //
+    //   2. Even if configure succeeds, the `data` target invokes the
+    //      freshly-built espeak-ng binary with --compile-phonemes / --compile=<lang>
+    //      to generate `phondata`, `phontab`, `phonindex` and per-language dicts.
+    //      On cross-compile that binary is iOS-arm64 and can't exec on the host
+    //      → build fails.
+    //
+    // Fix:
+    //   - Force MACOSX_BUNDLE off globally so the bare `install(TARGETS)` line
+    //     no longer trips the "no BUNDLE DESTINATION" check.
+    //   - Build only the `espeak-ng` static library target (skip binary + data)
+    //     for the iOS target — we only need libespeak-ng.a to link into the app.
+    //   - Run a separate HOST cmake build (macos, same arch as builder) to
+    //     produce the espeak-ng-data directory, and expose that path as
+    //     `cargo:data-dir=<...>` so downstream crates can bundle it into the
+    //     iOS app resources. At runtime the app passes this path to
+    //     espeak_ng_InitializePath() before any phonemize call.
+    //
+    // Non-iOS targets are unaffected: they take the existing config.build()
+    // path and get the full library + binary + data in one cmake run.
+    let target = env::var("TARGET").unwrap();
+    let host = env::var("HOST").unwrap();
+    let is_ios = target.contains("apple-ios");
+    let is_cross = target != host;
+
+    let bindings_dir = if is_ios {
+        config.define("CMAKE_MACOSX_BUNDLE", "OFF");
+        // spect.c branches on `#ifdef HAVE_SYS_ENDIAN_H` to pick its source of
+        // le16toh/le32toh. espeak-ng's cmake never sets this, so on hosts
+        // where <endian.h> doesn't define those macros (iOS SDK is one such)
+        // the build fails with "call to undeclared function 'le16toh'".
+        // The iOS SDK does ship `<sys/endian.h>` with the needed macros, so
+        // forcing this define selects the right header.
+        config.cflag("-DHAVE_SYS_ENDIAN_H=1");
+        config.cxxflag("-DHAVE_SYS_ENDIAN_H=1");
+        // Build only the static library target; don't attempt to install the
+        // binary (which would fail on iOS) and don't generate data (requires
+        // running the binary on host, handled separately below).
+        config.build_target("espeak-ng");
+        let target_install = config.build();
+
+        if is_cross {
+            build_host_espeak_data(&espeak_dst, &out_dir, &n_path_home);
+            let host_data_dir = out_dir.join("espeak-ng-data-host");
+            assert!(
+                host_data_dir.join("phondata").exists(),
+                "host espeak-ng build did not produce phondata at {:?}",
+                host_data_dir
+            );
+            println!("cargo:data-dir={}", host_data_dir.display());
+            debug_log!("host data dir: {}", host_data_dir.display());
+        }
+        target_install
+    } else {
+        config.build()
+    };
 
     // Search paths
     println!("cargo:rustc-link-search={}", out_dir.join("lib").display());
@@ -268,6 +436,14 @@ fn main() {
         "cargo:rustc-link-search={}",
         out_dir.join("build/src/ucd-tools").display()
     );
+    // iOS builds use `config.build_target("espeak-ng")` (no install step), so
+    // libespeak-ng.a stays in the build tree instead of landing in $OUT_DIR/lib.
+    if is_ios {
+        println!(
+            "cargo:rustc-link-search={}",
+            out_dir.join("build/src/libespeak-ng").display()
+        );
+    }
     println!("cargo:rustc-link-search={}", bindings_dir.display());
 
     if cfg!(windows) {
@@ -313,12 +489,16 @@ fn main() {
     }
 
     if target.contains("apple") {
-        // On (older) OSX we need to link against the clang runtime,
-        // which is hidden in some non-default path.
+        // On Apple targets we link against the clang compiler runtime to get
+        // helpers like `__chkstk_darwin` (stack probes, inserted when a frame
+        // uses >4KB, which happens with N_PATH_HOME=4096). The library ships
+        // per-platform: libclang_rt.osx.a on macOS, libclang_rt.ios.a on iOS.
+        // Mixing arches is a hard link error, so pick the right one.
         //
         // More details at https://github.com/alexcrichton/curl-rust/issues/279.
         if let Some(path) = macos_link_search_path() {
-            println!("cargo:rustc-link-lib=clang_rt.osx");
+            let rt_lib = if is_ios { "clang_rt.ios" } else { "clang_rt.osx" };
+            println!("cargo:rustc-link-lib={}", rt_lib);
             println!("cargo:rustc-link-search={}", path);
         }
     }
