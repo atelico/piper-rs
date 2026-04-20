@@ -237,6 +237,25 @@ fn main() {
         .very_verbose(std::env::var("CMAKE_VERBOSE").is_ok()) // Not verbose by default
         .always_configure(false);
 
+    // Raise espeak-ng's internal `N_PATH_HOME` buffer from the upstream
+    // default (160 on POSIX, 230 on Windows) to 4096. The buffer stores
+    // `PATH_ESPEAK_DATA` at startup, and on cargo builds the baked-in path
+    // routinely exceeds 160 chars (e.g. `<workspace>/target/<profile>/build/
+    // espeak-rs-sys-<hash>/out/share/espeak-ng-data`), which truncates the
+    // path at runtime and cascades into "Failed to open" / "Bad vowel file"
+    // failures during phoneme-data compilation. espeak-ng already defines
+    // N_PATH_HOME via `#ifndef`, so an external `-D` override is the
+    // sanctioned way to tune this. `ESPEAK_N_PATH_HOME` lets consumers pick
+    // a different size (e.g. lower for memory-constrained embedded builds).
+    //
+    // `cflag`/`cxxflag` append to cmake-rs's computed CMAKE_{C,CXX}_FLAGS so
+    // we don't clobber `-ffunction-sections -fPIC --target=... -w` etc.
+    let n_path_home = std::env::var("ESPEAK_N_PATH_HOME").unwrap_or_else(|_| "4096".to_string());
+    let flag = format!("-DN_PATH_HOME={}", n_path_home);
+    config.cflag(&flag);
+    config.cxxflag(&flag);
+    debug_log!("N_PATH_HOME override: {}", n_path_home);
+
     let bindings_dir = config.build();
 
     // Search paths
